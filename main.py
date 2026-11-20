@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import datetime
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -23,11 +24,30 @@ from models_and_xai import (
 )
 from report_generator import build_pdf_report
 
+# Track background loading state
+_models_loading = False
+_models_ready = False
+
+def _load_models_background():
+    """Load all models in a background thread so the server starts immediately."""
+    global _models_loading, _models_ready
+    _models_loading = True
+    print("Background thread: loading models into memory...")
+    try:
+        manager.load_all()
+        print(f"Background thread: all models loaded on {DEVICE}")
+    except Exception as e:
+        print(f"Background thread: model loading error — {e}")
+    finally:
+        _models_ready = True
+        _models_loading = False
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Loading models into memory...")
-    manager.load_all()
-    print("Ready on device:", DEVICE)
+    # Start model loading in a background thread — server binds the port immediately
+    thread = threading.Thread(target=_load_models_background, daemon=True)
+    thread.start()
+    print(f"Server started. Models loading in background on {DEVICE}...")
     yield
 
 app = FastAPI(title="Ovarian Cancer Two-Phase AI Pipeline", lifespan=lifespan)
@@ -57,6 +77,13 @@ def validate_img(file: UploadFile) -> Image.Image:
 @app.get("/")
 @app.get("/api/health")
 def health():
+    if _models_loading:
+        return {
+            "status": "loading",
+            "detail": "Models are loading in the background. The server is online but inference is not yet available.",
+            "device": DEVICE,
+            "models_loaded": manager.status,
+        }
     return {
         "status": "healthy" if all(manager.status.values()) else "degraded",
         "device": DEVICE,
@@ -67,7 +94,8 @@ def health():
 @app.post("/api/ultrasound/predict")
 async def predict_ultrasound(file: UploadFile = File(...)):
     if not manager.us_resnet or not manager.us_effnet:
-        raise HTTPException(503, "Ultrasound models not loaded")
+        msg = "Ultrasound models are still loading, please wait a moment and retry." if _models_loading else "Ultrasound models failed to load."
+        raise HTTPException(503, msg)
 
     img = validate_img(file)
     result_id = str(uuid.uuid4())
@@ -155,7 +183,8 @@ async def predict_ultrasound(file: UploadFile = File(...)):
 @app.post("/api/histopathology/predict")
 async def predict_histopathology(files: List[UploadFile] = File(...), ultrasound_result_id: Optional[str] = Form(None)):
     if not manager.histo_resnet or not manager.histo_effnet:
-        raise HTTPException(503, "Histopathology models not loaded")
+        msg = "Histopathology models are still loading, please wait a moment and retry." if _models_loading else "Histopathology models failed to load."
+        raise HTTPException(503, msg)
 
     result_id = ultrasound_result_id if ultrasound_result_id else str(uuid.uuid4())
     ts = datetime.datetime.utcnow().isoformat() + "Z"
