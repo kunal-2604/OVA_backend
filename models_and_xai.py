@@ -107,8 +107,17 @@ def get_ultrasound_category(class_name: str) -> str:
         return "Normal"
     return "Benign"
 
-# ── Model Registry & Loaders ──────────────────────────────────────────────────
+# ── Model Registry & Lazy Loaders ─────────────────────────────────────────────
+import gc
+
 class ModelManager:
+    """
+    Lazy, phase-swapping model manager.
+    Only one phase's models live in memory at a time.
+    When the other phase is requested, the current phase is unloaded first.
+    This keeps peak RAM under ~400 MB (PyTorch + 2 models).
+    """
+
     def __init__(self):
         self.us_resnet: Optional[nn.Module] = None
         self.us_resnet_target: Optional[nn.Module] = None
@@ -120,6 +129,8 @@ class ModelManager:
         self.histo_effnet: Optional[nn.Module] = None
         self.histo_effnet_target: Optional[nn.Module] = None
 
+        self._active_phase: Optional[str] = None  # "ultrasound" | "histopathology" | None
+
         self.status = {
             "ultrasound_resnet50": False,
             "ultrasound_efficientnet": False,
@@ -127,14 +138,52 @@ class ModelManager:
             "histopathology_efficientnet_b4": False,
         }
 
-    def load_all(self):
-        # 1. Ultrasound ResNet50
+    # ── Unload helpers ────────────────────────────────────────────────────────
+    def _unload_ultrasound(self):
+        self.us_resnet = None
+        self.us_resnet_target = None
+        self.us_effnet = None
+        self.us_effnet_target = None
+        self.status["ultrasound_resnet50"] = False
+        self.status["ultrasound_efficientnet"] = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Unloaded ultrasound models to free memory.")
+
+    def _unload_histopathology(self):
+        self.histo_resnet = None
+        self.histo_resnet_target = None
+        self.histo_effnet = None
+        self.histo_effnet_target = None
+        self.status["histopathology_resnet50"] = False
+        self.status["histopathology_efficientnet_b4"] = False
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("Unloaded histopathology models to free memory.")
+
+    # ── Load helpers ──────────────────────────────────────────────────────────
+    def ensure_ultrasound(self):
+        """Load ultrasound models if not already loaded. Unloads histopathology first."""
+        if self.us_resnet and self.us_effnet:
+            return  # already loaded
+
+        # Free the other phase first
+        if self._active_phase == "histopathology":
+            self._unload_histopathology()
+
+        print("Loading ultrasound models...")
+
+        # ResNet50
         try:
             m = models.resnet50(weights=None)
             m.fc = nn.Sequential(nn.Dropout(p=0.4), nn.Linear(m.fc.in_features, len(ULTRASOUND_CLASSES)))
             ckpt_p = MODELS_DIR / "ultrasound" / "resnet50_best.pth"
             ckpt = torch.load(ckpt_p, map_location=DEVICE, weights_only=False)
             m.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            del ckpt
+            gc.collect()
             m.to(DEVICE).eval()
             self.us_resnet = m
             self.us_resnet_target = m.layer4[-1]
@@ -142,13 +191,15 @@ class ModelManager:
         except Exception as e:
             print(f"Error loading Ultrasound ResNet50: {e}")
 
-        # 2. Ultrasound EfficientNet-B0
+        # EfficientNet-B0
         try:
             m = models.efficientnet_b0(weights=None)
             m.classifier = nn.Sequential(nn.Dropout(p=0.4), nn.Linear(m.classifier[1].in_features, len(ULTRASOUND_CLASSES)))
             ckpt_p = MODELS_DIR / "ultrasound" / "efficientnet_best.pth"
             ckpt = torch.load(ckpt_p, map_location=DEVICE, weights_only=False)
             m.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            del ckpt
+            gc.collect()
             m.to(DEVICE).eval()
             self.us_effnet = m
             self.us_effnet_target = m.features[-1]
@@ -156,7 +207,21 @@ class ModelManager:
         except Exception as e:
             print(f"Error loading Ultrasound EfficientNet: {e}")
 
-        # 3. Histopathology ResNet50
+        self._active_phase = "ultrasound"
+        print("Ultrasound models ready.")
+
+    def ensure_histopathology(self):
+        """Load histopathology models if not already loaded. Unloads ultrasound first."""
+        if self.histo_resnet and self.histo_effnet:
+            return  # already loaded
+
+        # Free the other phase first
+        if self._active_phase == "ultrasound":
+            self._unload_ultrasound()
+
+        print("Loading histopathology models...")
+
+        # ResNet50
         try:
             m = models.resnet50(weights=None)
             in_f = m.fc.in_features
@@ -164,6 +229,8 @@ class ModelManager:
             ckpt_p = MODELS_DIR / "histopathology" / "resnet_best.pth"
             ckpt = torch.load(ckpt_p, map_location=DEVICE, weights_only=False)
             m.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            del ckpt
+            gc.collect()
             m.to(DEVICE).eval()
             self.histo_resnet = m
             self.histo_resnet_target = m.layer4[-1]
@@ -171,7 +238,7 @@ class ModelManager:
         except Exception as e:
             print(f"Error loading Histopathology ResNet: {e}")
 
-        # 4. Histopathology EfficientNet-B4
+        # EfficientNet-B4
         try:
             m = timm.create_model("efficientnet_b4", pretrained=False, num_classes=0, global_pool="avg")
             in_f = m.num_features
@@ -182,12 +249,21 @@ class ModelManager:
             ckpt_p = MODELS_DIR / "histopathology" / "effnet_best.pth"
             ckpt = torch.load(ckpt_p, map_location=DEVICE, weights_only=False)
             m.load_state_dict(ckpt.get("model_state_dict", ckpt))
+            del ckpt
+            gc.collect()
             m.to(DEVICE).eval()
             self.histo_effnet = m
             self.histo_effnet_target = m.blocks[-1][-1]
             self.status["histopathology_efficientnet_b4"] = True
         except Exception as e:
             print(f"Error loading Histopathology EfficientNet: {e}")
+
+        self._active_phase = "histopathology"
+        print("Histopathology models ready.")
+
+    def load_all(self):
+        """Backward compat — just load ultrasound (the first phase the user hits)."""
+        self.ensure_ultrasound()
 
 manager = ModelManager()
 
